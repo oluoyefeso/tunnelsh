@@ -1,0 +1,61 @@
+name: tunnel-web
+
+on: [push]
+
+env:
+    NEXT_PUBLIC_APP_URL: "https://tunnelsh.top"
+    NEXT_PUBLIC_SUPABASE_URL: "https://bssmatjwdmofqzozrfvz.supabase.co"
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+
+jobs:
+
+    build:
+      if: github.ref == 'refs/heads/main'
+      runs-on: ubuntu-latest
+      steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build Go project
+        run: |
+          go mod download
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o tunnelsh-backend main.go
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deploy
+          cp tunnelsh-backend deploy/
+
+      - name: Copy files via SSH
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          key: ${{ secrets.SECRET }}
+          port: 22
+          source: "./deploy/*"
+          target: 'home/user/tunnelsh-backend'
+
+
+    deploy:
+      needs: build
+      if: github.ref == 'refs/heads/main'
+      runs-on: [ubuntu-latest]
+      steps:
+          - uses: actions/checkout@v1
+          - name: Push to tunnelsh server
+            uses: appleboy/ssh-action@master
+            with:
+                host: "202.92.215.2"
+                username: ${{ secrets.USERNAME }}
+                key: ${{ secrets.SECRET }}
+                port: 22
+                script: |
+                    cd /home/user/tunnelsh-backend
+                    chmod +x tunnelsh-backend
+                    # Stop existing process if running
+                    pkill -f './tunnelsh-backend' || true
+                    # Start the application in background
+                    nohup ./tunnelsh-backend > tunnelsh-backend.log 2>&1 &
