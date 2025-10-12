@@ -37,7 +37,7 @@ jobs:
           key: ${{ secrets.SECRET }}
           port: 22
           source: "./deploy/*"
-          target: 'home/user/tunnelsh-backend'
+          target: '/home/ubuntu/tunnelsh-backend'
 
     deploy:
       needs: build
@@ -53,9 +53,9 @@ jobs:
                 key: ${{ secrets.SECRET }}
                 port: 22
                 script: |
-                    cd /home/user/tunnelsh-backend
-                    chmod +x tunnelsh-backend
+                    cd /home/ubuntu/tunnelsh-backend
+                    sudo chmod +x tunnelsh-backend
                     # Stop existing process if running
-                    pkill -f './tunnelsh-backend' || true
+                    sudo pkill -f './tunnelsh-backend' || true
                     # Start the application in background
-                    nohup ./tunnelsh-backend > tunnelsh-backend.log 2>&1 &
+                    sudo nohup ./tunnelsh-backend > tunnelsh-backend.log 2>&1 &
