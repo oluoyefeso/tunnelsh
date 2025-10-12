@@ -53,7 +53,7 @@ jobs:
                 key: ${{ secrets.SECRET }}
                 port: 22
                 script: |
-                    cd /home/ubuntu/tunnelsh-backend/deploy
+                    sudo cd /home/ubuntu/tunnelsh-backend/deploy
                     sudo chmod +x tunnelsh-backend
                     # Stop existing process if running
                     sudo pkill -f './tunnelsh-backend' || true
