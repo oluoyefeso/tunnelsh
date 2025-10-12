@@ -39,7 +39,6 @@ jobs:
           source: "./deploy/*"
           target: 'home/user/tunnelsh-backend'
 
-
     deploy:
       needs: build
       if: github.ref == 'refs/heads/main'
