@@ -65,4 +65,21 @@ jobs:
                 key: ${{ secrets.SECRET }}
                 port: 22
                 script: |
-                    echo "Done"
+                    cd ~/tunnelsh-backend/deploy
+                    sudo chmod +x tunnelsh-backend start.sh
+                    # Stop existing process if running
+                    sudo pkill -f 'tunnelsh-backend' || true
+                    sleep 2
+
+                    # Start using the script
+                    sudo bash start.sh
+
+                    # Verify it started
+                    sleep 1
+                    if pgrep -f 'tunnelsh-backend' > /dev/null; then
+                      echo "Application started successfully"
+                      echo "Logs: ~/tunnelsh-backend/deploy/logs/latest.log"
+                    else
+                      echo "Failed to start. Check logs."
+                      exit 1
+                    fi
