@@ -35,7 +35,8 @@ jobs:
           cd "$(dirname "$0")"
           mkdir -p logs
           LOG_FILE="logs/app_$(date +%Y%m%d_%H%M%S).log"
-          setsid ./tunnelsh-backend > "$LOG_FILE" 2>&1 < /dev/null &
+          nohup ./tunnelsh-backend > "$LOG_FILE" 2>&1 < /dev/null &
+          disown
           ln -sf "$LOG_FILE" logs/latest.log
           echo "Started tunnelsh-backend with PID: $!"
           EOF
