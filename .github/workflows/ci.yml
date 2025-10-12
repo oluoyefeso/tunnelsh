@@ -29,6 +29,18 @@ jobs:
           mkdir -p deploy
           cp tunnelsh-backend deploy/
 
+          # Create startup script
+          cat > deploy/start.sh << 'EOF'
+          #!/bin/bash
+          cd "$(dirname "$0")"
+          mkdir -p logs
+          LOG_FILE="logs/app_$(date +%Y%m%d_%H%M%S).log"
+          setsid ./tunnelsh-backend > "$LOG_FILE" 2>&1 < /dev/null &
+          ln -sf "$LOG_FILE" logs/latest.log
+          echo "Started tunnelsh-backend with PID: $!"
+          EOF
+          sudo chmod +x deploy/start.sh
+
       - name: Copy files via SSH
         uses: appleboy/scp-action@v1
         with:
@@ -53,8 +65,19 @@ jobs:
                 key: ${{ secrets.SECRET }}
                 port: 22
                 script: |
-                    sudo chmod +x tunnelsh-backend/deploy/tunnelsh-backend
+                    cd /home/ubuntu/tunnelsh-backend/deploy
+                    sudo chmod +x tunnelsh-backend start.sh
                     # Stop existing process if running
-                    sudo pkill -f 'tunnelsh-backend/deploy/tunnelsh-backend' || true
+                    sudo pkill -f 'tunnelsh-backend' || true
+                    sleep 2
                     # Start the application in background
-                    sudo nohup tunnelsh-backend/deploy/tunnelsh-backend > tunnelsh-backend.log 2>&1 &
+
+                    # Verify it started
+                    sleep 1
+                    if pgrep -f 'tunnelsh-backend' > /dev/null; then
+                      echo "Application started successfully"
+                      echo "Logs: /home/ubuntu/tunnelsh-backend/deploy/logs/latest.log"
+                    else
+                      echo "Failed to start. Check logs."
+                      exit 1
+                    fi
