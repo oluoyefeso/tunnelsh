@@ -66,7 +66,7 @@ func (sr *SubdomainRegistry) Count() int {
 func main() {
 	var port = flag.String("p", "9999", "server port to use")
 	var host = flag.String("h", "start.tunnelsh.top", "server hostname to use")
-	var addr = flag.String("b", "127.0.0.1", "ip to bind [server only]")
+	var addr = flag.String("b", "0.0.0.0", "ip to bind [server only]")
 	flag.Parse()
 
 	// server usage: groktunnel [-h=<hostname>] [-b=<bind ip>]
