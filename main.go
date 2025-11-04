@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	vhost "github.com/inconshreveable/go-vhost"
 	"github.com/progrium/qmux/golang/session"
 )
 
@@ -29,12 +31,16 @@ type SubdomainRegistry struct {
 type ClientSession struct {
 	session    *session.Session
 	publicHost string
-	// listener   net.Listener
+	listener   net.Listener // vhost listener for tunnel traffic
+	mu         sync.Mutex
+	closed     bool
 }
 
 var registry = &SubdomainRegistry{
 	subdomains: make(map[string]*ClientSession),
 }
+
+var tunnelVMux *vhost.HTTPMuxer // Global tunnel vhost muxer
 
 func (sr *SubdomainRegistry) Register(subdomain string, cs *ClientSession) {
 	sr.mu.Lock()
@@ -46,12 +52,11 @@ func (sr *SubdomainRegistry) Register(subdomain string, cs *ClientSession) {
 func (sr *SubdomainRegistry) Unregister(subdomain string) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-	if _, exists := sr.subdomains[subdomain]; exists {
-		// Clean up listener
-		// if cs.listener != nil {
-		// 	cs.listener.Close()
-		// }
-		// cs.session.Close()
+	if cs, exists := sr.subdomains[subdomain]; exists {
+		// Close the vhost listener for this subdomain
+		if cs.listener != nil {
+			cs.listener.Close()
+		}
 		delete(sr.subdomains, subdomain)
 		log.Printf("Unregistered subdomain: %s", subdomain)
 	}
@@ -69,6 +74,249 @@ func (sr *SubdomainRegistry) Count() int {
 	return len(sr.subdomains)
 }
 
+func main() {
+	var controlPort = flag.String("c", "8443", "control port (direct TLS)")
+	var tunnelPort = flag.String("t", "9999", "tunnel port (HTTP from nginx)")
+	var host = flag.String("h", "start.tunnelsh.top", "server hostname to use")
+	var addr = flag.String("b", "0.0.0.0", "ip to bind")
+	var tunnelAddr = flag.String("tunnelAddr", "127.0.0.1", "tunnel ip to bind")
+	var certFile = flag.String("cert", "/etc/letsencrypt/live/tunnelsh.top/fullchain.pem", "TLS certificate file")
+	var keyFile = flag.String("key", "/etc/letsencrypt/live/tunnelsh.top/privkey.pem", "TLS key file")
+	flag.Parse()
+
+	// Status reporting goroutine
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			log.Printf("Active subdomains: %d", registry.Count())
+		}
+	}()
+
+	// Start control server (port 8443 - direct TLS with vhost)
+	go startControlServer(*addr, *controlPort, *host, *certFile, *keyFile)
+
+	// Start tunnel server (port 9999 - HTTP from nginx)
+	startTunnelServer(*tunnelAddr, *tunnelPort, *host)
+}
+
+// Control server - handles client connections on port 8443 with direct TLS
+func startControlServer(addr, port, host, certFile, keyFile string) {
+	log.Printf("Starting control server on %s:%s", addr, port)
+
+	// Load TLS certificate
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Fatalf("Failed to load TLS certificate: %v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	// Listen with TLS
+	l, err := tls.Listen("tcp", net.JoinHostPort(addr, port), tlsConfig)
+	if err != nil {
+		log.Fatalf("Failed to listen on control port: %v", err)
+	}
+	defer l.Close()
+
+	// Create vhost muxer on TLS listener
+	vmux, err := vhost.NewHTTPMuxer(l, 1*time.Second)
+	if err != nil {
+		log.Fatalf("Failed to create vhost muxer: %v", err)
+	}
+
+	// Listen for control connections on start.tunnelsh.top
+	ml, err := vmux.Listen(host)
+	if err != nil {
+		log.Fatalf("Failed to listen on vhost: %v", err)
+	}
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handleClientConnection(host, w, r)
+		}),
+	}
+
+	log.Printf("Control endpoint ready: https://%s:%s", host, port)
+
+	// Handle vhost errors in background
+	go func() {
+		for {
+			conn, err := vmux.NextError()
+			if err != nil {
+				log.Printf("VMux error: %v", err)
+			}
+			if conn != nil {
+				conn.Close()
+			}
+		}
+	}()
+
+	if err := srv.Serve(ml); err != nil {
+		log.Fatalf("Control server error: %v", err)
+	}
+}
+
+// Tunnel server - handles public requests on port 9999 (proxied from nginx)
+func startTunnelServer(addr, port, host string) {
+	log.Printf("Starting tunnel server on %s:%s", addr, port)
+
+	// Listen for raw TCP connections
+	l, err := net.Listen("tcp", net.JoinHostPort(addr, port))
+	if err != nil {
+		log.Fatalf("Failed to listen on tunnel port: %v", err)
+	}
+	defer l.Close()
+
+	// Create vhost muxer for HTTP-based routing
+	vmux, err := vhost.NewHTTPMuxer(l, 1*time.Second)
+	if err != nil {
+		log.Fatalf("Failed to create tunnel vhost muxer: %v", err)
+	}
+
+	// Store globally so handleClientConnection can use it
+	tunnelVMux = vmux
+
+	log.Printf("Tunnel endpoint ready on %s (proxied from nginx, using vhost)", net.JoinHostPort(addr, port))
+
+	// Handle vhost errors
+	for {
+		conn, err := vmux.NextError()
+		if err != nil {
+			log.Printf("Tunnel VMux error: %v", err)
+		}
+		if conn != nil {
+			conn.Close()
+		}
+	}
+}
+
+// Handle client control connection (on port 8443)
+func handleClientConnection(host string, w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Control] Client connection from %s", r.RemoteAddr)
+
+	// Check for upgrade header
+	if r.Header.Get("Upgrade") != "tunnelsh/1.0" {
+		log.Printf("[Control] Missing upgrade header")
+		http.Error(w, "Missing upgrade header", http.StatusBadRequest)
+		return
+	}
+
+	// Extract base domain from control host
+	parts := strings.SplitN(host, ".", 2)
+	if len(parts) < 2 {
+		log.Printf("[Control] Invalid control host: %s", host)
+		http.Error(w, "Invalid server configuration", http.StatusInternalServerError)
+		return
+	}
+	baseDomain := parts[1]
+
+	// Generate unique subdomain
+	publicHost := fmt.Sprintf("%s%s", newSubdomain(), baseDomain)
+
+	log.Printf("[Control] Assigning subdomain: %s", publicHost)
+
+	// Create vhost listener for this subdomain on the tunnel port
+	tunnelListener, err := tunnelVMux.Listen(publicHost)
+	if err != nil {
+		log.Printf("[Control] Failed to create tunnel listener for %s: %v", publicHost, err)
+		http.Error(w, "Failed to create subdomain", http.StatusInternalServerError)
+		return
+	}
+
+	// Send response with public host info
+	w.Header().Set("X-Public-Host", publicHost)
+	w.Header().Set("Connection", "Upgrade")
+	w.Header().Set("Upgrade", "tunnelsh/1.0")
+	w.WriteHeader(http.StatusOK)
+
+	// Hijack connection for session multiplexing
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Printf("[Control] Failed to hijack connection: %v", err)
+		tunnelListener.Close()
+		return
+	}
+
+	log.Printf("[Control] %s: connection hijacked, creating session", publicHost)
+
+	// Create session for this client
+	sess := session.New(conn)
+
+	// Create client session record
+	cs := &ClientSession{
+		session:    sess,
+		publicHost: publicHost,
+		listener:   tunnelListener,
+		closed:     false,
+	}
+
+	// Register the subdomain
+	registry.Register(publicHost, cs)
+
+	log.Printf("[Control] %s: session registered with tunnel listener", publicHost)
+
+	// Handle this client in a separate goroutine
+	go handleClientSession(cs)
+}
+
+// Handle public tunnel requests (on port 9999 from nginx)
+// func handlePublicRequest(w http.ResponseWriter, r *http.Request, hostname string) {
+// 	// This function is no longer needed since we're using vhost listeners
+// 	// The traffic is handled directly in handleClientSession
+// 	log.Printf("[Tunnel] Unexpected direct HTTP request for %s", hostname)
+// 	http.Error(w, "Use vhost routing", http.StatusInternalServerError)
+// }
+
+func handleClientSession(cs *ClientSession) {
+	log.Printf("[Session] %s: starting session", cs.publicHost)
+
+	defer func() {
+		log.Printf("[Session] %s: ending session", cs.publicHost)
+
+		cs.mu.Lock()
+		cs.closed = true
+		cs.mu.Unlock()
+
+		registry.Unregister(cs.publicHost)
+		cs.session.Close()
+	}()
+
+	// Handle incoming public requests from the vhost listener
+	go func() {
+		for {
+			// Accept connection from nginx via vhost muxer
+			conn, err := cs.listener.Accept()
+			if err != nil {
+				log.Printf("[Session] %s: listener accept error: %v", cs.publicHost, err)
+				return
+			}
+
+			log.Printf("[Session] %s: handling public request", cs.publicHost)
+
+			// Open channel to client through qmux session
+			ch, err := cs.session.Open(context.Background())
+			if err != nil {
+				log.Printf("[Session] %s: failed to open session channel: %v", cs.publicHost, err)
+				conn.Close()
+				return
+			}
+
+			// Bridge the connections (nginx ←→ client)
+			go join(ch, conn)
+		}
+	}()
+
+	// Wait for session to end (client disconnect)
+	log.Printf("[Session] %s: waiting for session to end", cs.publicHost)
+	cs.session.Wait()
+	log.Printf("[Session] %s: session ended - client disconnected", cs.publicHost)
+}
+
+// bufConn combines a buffered reader/writer with the underlying connection
 type bufConn struct {
 	io.Reader
 	io.Writer
@@ -82,187 +330,11 @@ func (bc *bufConn) Read(p []byte) (int, error) {
 func (bc *bufConn) Write(p []byte) (int, error) {
 	n, err := bc.Writer.Write(p)
 	if err == nil {
-		// Flush after each write to ensure data is sent immediately
 		if f, ok := bc.Writer.(interface{ Flush() error }); ok {
 			f.Flush()
 		}
 	}
 	return n, err
-}
-
-func main() {
-	var port = flag.String("p", "9999", "server port to use")
-	var host = flag.String("h", "start.tunnelsh.top", "server hostname to use")
-	var addr = flag.String("b", "127.0.0.1", "ip to bind [server only]")
-	flag.Parse()
-
-	// server usage: groktunnel [-h=<hostname>] [-b=<bind ip>]
-	// l, err := net.Listen("tcp", net.JoinHostPort(*addr, *port))
-	// fatal(err)
-	// defer l.Close()
-	// vmux, err := vhost.NewHTTPMuxer(l, 1*time.Second)
-	// fatal(err)
-
-	// go serve(vmux, *host, *port)
-
-	// Status reporting goroutine
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			log.Printf("Active subdomains: %d", registry.Count())
-		}
-	}()
-
-	mux := http.NewServeMux()
-
-	// Route for control connection (client connects here)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleRequest(w, r, *host)
-	})
-
-	srv := &http.Server{
-		Addr:    net.JoinHostPort(*addr, *port),
-		Handler: mux,
-		// No timeouts - we handle long-lived connections
-	}
-
-	log.Printf("groktunnel server ready on %s!", srv.Addr)
-	log.Printf("Control endpoint: %s", *host)
-	log.Fatal(srv.ListenAndServe())
-}
-
-func handleRequest(w http.ResponseWriter, r *http.Request, controlHost string) {
-	// Get the hostname from the request
-	hostname := r.Host
-
-	// Remove port if present
-	if idx := strings.Index(hostname, ":"); idx != -1 {
-		hostname = hostname[:idx]
-	}
-
-	log.Printf("Request for host: %s", hostname)
-
-	// Check if this is a control connection (client registering)
-	if hostname == controlHost {
-		handleInitialClientConnection(w, r, controlHost)
-		return
-	}
-
-	// This is a public request to a tunnel subdomain
-	handleWildCardClientConnection(w, r, hostname)
-}
-
-func handleWildCardClientConnection(w http.ResponseWriter, r *http.Request, hostname string) {
-	log.Printf("%s: handling public request", hostname)
-
-	// Find the inital client session for this subdomain
-	cs := registry.Get(hostname)
-	if cs == nil {
-		log.Printf("%s: no active tunnel found", hostname)
-		http.Error(w, "Tunnel not found or inactive", http.StatusNotFound)
-		return
-	}
-
-	ch, err := cs.session.Open(context.Background())
-	if err != nil {
-		log.Printf("%s: failed to open session channel: %v", hostname, err)
-		http.Error(w, "Failed to open tunnel channel", http.StatusBadGateway)
-		return
-	}
-	defer ch.Close()
-
-	// Write the original HTTP request to the tunnel so client receives it
-	if err := r.Write(ch); err != nil {
-		log.Printf("%s: failed to write request to tunnel: %v", hostname, err)
-		http.Error(w, "Failed to forward request", http.StatusBadGateway)
-		return
-	}
-
-	conn, bufrw, err := w.(http.Hijacker).Hijack()
-	if err != nil {
-		log.Printf("%s: failed to hijack connection: %v", hostname, err)
-		return
-	}
-	defer conn.Close()
-
-	// Bridge the connections (tunnel response → nginx)
-	// Write the original HTTP request to the tunnel
-	// The client will receive this and forward to localhost
-	if err := r.Write(ch); err != nil {
-		log.Printf("%s: failed to write request to tunnel: %v", hostname, err)
-		ch.Close()
-		conn.Close()
-		return
-	}
-
-	// Bridge: Copy bidirectionally between tunnel and nginx connection
-	// Use the existing join function with buffered connection
-	join(ch, &bufConn{bufrw.Reader, bufrw, conn})
-}
-
-func handleInitialClientConnection(w http.ResponseWriter, r *http.Request, host string) {
-
-	parts := strings.SplitN(host, ".", 2)
-
-	// Check if the split operation resulted in at least two parts (subdomain and base domain)
-	if len(parts) < 2 {
-		log.Fatalf("Error: Domain string '%s' does not appear to contain a subdomain.", host)
-	}
-
-	// The base domain is the second element after the split
-	baseDomain := parts[1]
-
-	// Generate unique subdomain
-	//	publicHost := strings.TrimSuffix(net.JoinHostPort(newSubdomain()+baseDomain, port), ":80")
-	publicHostOnly := fmt.Sprintf("%s%s", newSubdomain(), baseDomain)
-
-	publicHost := publicHostOnly
-	log.Printf("New client requesting subdomain: %s", publicHost)
-
-	// Send response with public host info
-	w.Header().Add("X-Public-Host", publicHost)
-	w.Header().Add("Connection", "Upgrade")
-	w.Header().Set("Upgrade", "tunnelsh/1.0")
-	w.WriteHeader(http.StatusOK)
-
-	// Upgrade to raw TCP connection for session multiplexing
-	conn, _, err := w.(http.Hijacker).Hijack()
-	if err != nil {
-		log.Printf("Failed to hijack connection: %v", err)
-		// pl.Close()
-		return
-	}
-
-	// Create session for this client
-	sess := session.New(conn)
-
-	// Create client session record
-	cs := &ClientSession{
-		session:    sess,
-		publicHost: publicHost,
-		// listener:   pl,
-	}
-
-	// Register the subdomain
-	registry.Register(publicHost, cs)
-
-	// Handle this client in a separate goroutine
-	go handleClientSession(cs)
-}
-
-func handleClientSession(cs *ClientSession) {
-	log.Printf("%s: starting session", cs.publicHost)
-
-	// Ensure cleanup happens
-	defer func() {
-		log.Printf("%s: ending session", cs.publicHost)
-		registry.Unregister(cs.publicHost)
-		cs.session.Close()
-	}()
-
-	// Wait for session to end (client disconnect)
-	cs.session.Wait()
 }
 
 func join(a io.ReadWriteCloser, b io.ReadWriteCloser) {
@@ -314,11 +386,4 @@ func newSubdomain() string {
 		r[i] = letters[int(b[i])*len(letters)/256]
 	}
 	return string(r) + "."
-}
-
-func fatal(err error) {
-	if err != nil {
-		log.Printf("Fatal error: %v", err)
-		log.Fatal(err)
-	}
 }
