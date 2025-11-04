@@ -80,8 +80,8 @@ func main() {
 	var host = flag.String("h", "start.tunnelsh.top", "server hostname to use")
 	var addr = flag.String("b", "0.0.0.0", "ip to bind")
 	var tunnelAddr = flag.String("tunnelAddr", "127.0.0.1", "tunnel ip to bind")
-	var certFile = flag.String("cert", "/etc/letsencrypt/live/tunnelsh.top/fullchain.pem", "TLS certificate file")
-	var keyFile = flag.String("key", "/etc/letsencrypt/live/tunnelsh.top/privkey.pem", "TLS key file")
+	var certFile = flag.String("cert", "/etc/letsencrypt/live/tunnelsh.top-0001/fullchain.pem", "TLS certificate file")
+	var keyFile = flag.String("key", "/etc/letsencrypt/live/tunnelsh.top-0001/privkey.pem", "TLS key file")
 	flag.Parse()
 
 	// Status reporting goroutine
