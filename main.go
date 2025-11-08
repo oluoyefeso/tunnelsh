@@ -341,31 +341,56 @@ func join(a io.ReadWriteCloser, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Copy from a to b
-	go func() {
+	// Copy with explicit flushing to preserve chunked transfer encoding
+	copyWithFlush := func(dst io.Writer, src io.Reader, name string) {
 		defer wg.Done()
-		n, err := io.Copy(b, a)
-		if err != nil && err != io.EOF {
-			log.Printf("Copy a->b error after %d bytes: %v", n, err)
+
+		buf := make([]byte, 32*1024) // 32KB buffer
+		totalBytes := int64(0)
+
+		for {
+			nr, er := src.Read(buf)
+			if nr > 0 {
+				totalBytes += int64(nr)
+				nw, ew := dst.Write(buf[0:nr])
+
+				// Flush immediately after each write to preserve chunk boundaries
+				// This is critical for chunked transfer encoding used by SPA dev servers
+				if f, ok := dst.(interface{ Flush() error }); ok {
+					if err := f.Flush(); err != nil {
+						log.Printf("Copy %s flush error after %d bytes: %v", name, totalBytes, err)
+						break
+					}
+				}
+
+				if ew != nil {
+					log.Printf("Copy %s write error after %d bytes: %v", name, totalBytes, ew)
+					break
+				}
+				if nr != nw {
+					log.Printf("Copy %s short write: read %d, wrote %d", name, nr, nw)
+					break
+				}
+			}
+			if er != nil {
+				if er != io.EOF {
+					log.Printf("Copy %s read error after %d bytes: %v", name, totalBytes, er)
+				}
+				break
+			}
 		}
-		// Close write end of b when done reading from a
-		if cw, ok := b.(CloseWriter); ok {
+
+		// Close write end when done
+		if cw, ok := dst.(CloseWriter); ok {
 			cw.CloseWrite()
 		}
-	}()
+	}
+
+	// Copy from a to b
+	go copyWithFlush(b, a, "a->b")
 
 	// Copy from b to a
-	go func() {
-		defer wg.Done()
-		n, err := io.Copy(a, b)
-		if err != nil && err != io.EOF {
-			log.Printf("Copy b->a error after %d bytes: %v", n, err)
-		}
-		// Close write end of a when done reading from b
-		if cw, ok := a.(CloseWriter); ok {
-			cw.CloseWrite()
-		}
-	}()
+	go copyWithFlush(a, b, "b->a")
 
 	// Wait for both directions to finish
 	wg.Wait()
