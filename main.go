@@ -241,6 +241,13 @@ func handleClientConnection(host string, w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Disable Nagle's algorithm on control connection for lower latency
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			log.Printf("[Control] %s: failed to set TCP_NODELAY: %v", publicHost, err)
+		}
+	}
+
 	log.Printf("[Control] %s: connection hijacked, creating session", publicHost)
 
 	// Create session for this client
@@ -293,6 +300,14 @@ func handleClientSession(cs *ClientSession) {
 			if err != nil {
 				log.Printf("[Session] %s: listener accept error: %v", cs.publicHost, err)
 				return
+			}
+
+			// Disable Nagle's algorithm to reduce latency for streaming responses
+			// This ensures data is sent immediately without TCP-level buffering
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				if err := tcpConn.SetNoDelay(true); err != nil {
+					log.Printf("[Session] %s: failed to set TCP_NODELAY: %v", cs.publicHost, err)
+				}
 			}
 
 			log.Printf("[Session] %s: handling public request", cs.publicHost)
