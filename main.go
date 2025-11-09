@@ -246,6 +246,16 @@ func handleClientConnection(host string, w http.ResponseWriter, r *http.Request)
 		if err := tcpConn.SetNoDelay(true); err != nil {
 			log.Printf("[Control] %s: failed to set TCP_NODELAY: %v", publicHost, err)
 		}
+
+		// Tune TCP buffer sizes to reduce kernel-level buffering
+		// Smaller buffers force more frequent sends, reducing latency
+		const bufferSize = 4096 // 4KB buffers
+		if err := tcpConn.SetReadBuffer(bufferSize); err != nil {
+			log.Printf("[Control] %s: failed to set read buffer: %v", publicHost, err)
+		}
+		if err := tcpConn.SetWriteBuffer(bufferSize); err != nil {
+			log.Printf("[Control] %s: failed to set write buffer: %v", publicHost, err)
+		}
 	}
 
 	log.Printf("[Control] %s: connection hijacked, creating session", publicHost)
@@ -307,6 +317,16 @@ func handleClientSession(cs *ClientSession) {
 			if tcpConn, ok := conn.(*net.TCPConn); ok {
 				if err := tcpConn.SetNoDelay(true); err != nil {
 					log.Printf("[Session] %s: failed to set TCP_NODELAY: %v", cs.publicHost, err)
+				}
+
+				// Tune TCP buffer sizes for lower latency
+				// Smaller buffers reduce kernel buffering, especially important for chunked responses
+				const bufferSize = 4096 // 4KB buffers
+				if err := tcpConn.SetReadBuffer(bufferSize); err != nil {
+					log.Printf("[Session] %s: failed to set read buffer: %v", cs.publicHost, err)
+				}
+				if err := tcpConn.SetWriteBuffer(bufferSize); err != nil {
+					log.Printf("[Session] %s: failed to set write buffer: %v", cs.publicHost, err)
 				}
 			}
 
